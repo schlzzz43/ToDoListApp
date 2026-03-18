@@ -11,11 +11,6 @@ try:
 except ImportError:
     PIL_AVAILABLE = False
 
-try:
-    from tkcalendar import DateEntry
-    CALENDAR_AVAILABLE = True
-except ImportError:
-    CALENDAR_AVAILABLE = False
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_FILE = os.path.join(BASE_DIR, "todos.json")
@@ -67,10 +62,8 @@ class TodoApp:
         self.filter_var = tk.StringVar(value="全部")
         self.todos = []
         self._pending_images = []   # [(tmp_path, PhotoImage), ...]
-        self._input_photo_refs = [] # keep PhotoImages alive in input widget
         self._click_timer = None    # for single/double click disambiguation
 
-        self._check_deps()
         self.load_data()
         self.build_ui()
         self.refresh_all_views()
@@ -85,18 +78,6 @@ class TodoApp:
             except OSError:
                 pass
         self.root.destroy()
-
-    # ── Dependency check ──────────────────────────────────
-    def _check_deps(self):
-        missing = []
-        if not PIL_AVAILABLE:
-            missing.append("pillow  (图片粘贴功能不可用)")
-        if not CALENDAR_AVAILABLE:
-            missing.append("tkcalendar  (日历选择功能不可用，将使用文本输入)")
-        if missing:
-            print("提示：以下依赖未安装，部分功能受限：")
-            for m in missing:
-                print(f"  pip install {m.split()[0]}")
 
     # ── Data ──────────────────────────────────────────────
     def load_data(self):
@@ -140,7 +121,6 @@ class TodoApp:
         tk.Label(frame, text=hint, bg="#f0f0f0", fg="#aaa",
                  font=("Microsoft YaHei", 7)).pack(anchor="w", pady=(0, 2))
 
-        # Multi-line text widget
         self.task_text = tk.Text(frame, height=4, font=("Microsoft YaHei", 10),
                                  wrap="word", relief="solid", bd=1,
                                  bg="white", padx=4, pady=4)
@@ -148,7 +128,6 @@ class TodoApp:
         self.task_text.bind("<Control-v>", self.paste_image)
         self.task_text.bind("<Control-Return>", lambda e: self.add_todo())
 
-        # Date row
         date_row = tk.Frame(frame, bg="#f0f0f0")
         date_row.pack(fill="x")
 
@@ -215,7 +194,6 @@ class TodoApp:
                 photo = ImageTk.PhotoImage(thumb)
 
                 self._pending_images.append((tmp_path, photo))
-                self._input_photo_refs.append(photo)
 
                 self.task_text.image_create(tk.INSERT, image=photo, padx=2, pady=2)
                 self.task_text.insert(tk.INSERT, "\n")
@@ -278,7 +256,6 @@ class TodoApp:
         # Reset input
         self.task_text.delete("1.0", tk.END)
         self._pending_images.clear()
-        self._input_photo_refs.clear()
         self.date_entry.delete(0, "end")
         self.date_entry.insert(0, str(date.today()))
 
@@ -317,6 +294,7 @@ class TodoApp:
         win.attributes("-topmost", True)
         win.configure(bg="#f0f0f0")
         win._photo_refs = []
+        win._image_map = {}   # str(photo) → absolute file path (for double-click open)
 
         # ── Header (editable) ──
         hdr = tk.Frame(win, bg="#f0f0f0", padx=12, pady=10)
@@ -367,7 +345,8 @@ class TodoApp:
         def save_detail():
             new_title = title_var.get().strip()
             new_date = date_var.get().strip()
-            new_content = content_text.get("1.0", "end-1c").strip()
+            raw = content_text.get("1.0", "end-1c")
+            new_content = raw.replace("\ufffc", "").strip()
             if not new_title:
                 messagebox.showwarning("提示", "标题不能为空", parent=win)
                 return
@@ -376,12 +355,25 @@ class TodoApp:
             except ValueError:
                 messagebox.showwarning("提示", "日期格式错误，请使用 YYYY-MM-DD", parent=win)
                 return
+            # Finalize newly pasted images
+            kept_images = list(t.get("images", []))
+            for tmp_path, _ in win._detail_pending:
+                new_name = f"{todo_id}_{uuid.uuid4().hex[:8]}.png"
+                new_path = os.path.join(IMAGES_DIR, new_name)
+                try:
+                    if os.path.exists(tmp_path):
+                        os.rename(tmp_path, new_path)
+                        kept_images.append(os.path.join("images", new_name))
+                except OSError:
+                    pass
+            win._detail_pending.clear()
             for todo in self.todos:
                 if todo["id"] == todo_id:
                     todo["title"] = new_title
                     todo["date"] = new_date
                     todo["content"] = new_content
                     todo["done"] = done_var.get()
+                    todo["images"] = kept_images
                     break
             self.save_data()
             self.refresh_all_views()
@@ -390,39 +382,85 @@ class TodoApp:
         tk.Button(btn_row, text="保存", command=save_detail,
                   bg="#4CAF50", fg="white", font=("Microsoft YaHei", 9, "bold"),
                   relief="flat", padx=16, cursor="hand2").pack(side="left", padx=6)
-        tk.Button(btn_row, text="关闭", command=win.destroy,
+        tk.Button(btn_row, text="关闭", command=lambda: on_detail_close(),
                   bg="#666", fg="white", font=("Microsoft YaHei", 9),
                   relief="flat", padx=16, cursor="hand2").pack(side="left", padx=6)
 
-        # ── Editable content (packed last so it fills remaining space) ──
-        tk.Label(win, text="内容", bg="#f0f0f0", fg="#888",
+        # ── Content + Images (same editable widget as add-task view) ──
+        tk.Label(win, text="内容  （Ctrl+V 可粘贴截图）", bg="#f0f0f0", fg="#888",
                  font=("Microsoft YaHei", 8), anchor="w").pack(anchor="w", padx=14, pady=(6, 0))
 
         content_text = tk.Text(win, font=("Microsoft YaHei", 10), wrap="word",
                                relief="solid", bd=1, bg="white", padx=6, pady=6)
         content_text.pack(fill="both", expand=True, padx=12, pady=(2, 4))
-        content_text.insert("1.0", t.get("content", ""))
 
-        # Images (scrollable frame below content)
-        if PIL_AVAILABLE and t.get("images"):
-            img_scroll = ScrollableFrame(win, height=160, bg="#f0f0f0")
-            img_scroll.pack(fill="x", padx=12, pady=(0, 4))
-            for img_rel in t["images"]:
+        # Insert existing text, then embed existing images inline
+        content_text.insert("1.0", t.get("content", ""))
+        if PIL_AVAILABLE:
+            for img_rel in t.get("images", []):
                 img_path = os.path.join(BASE_DIR, img_rel)
                 if os.path.exists(img_path):
                     try:
                         img = Image.open(img_path)
-                        img.thumbnail((440, 260))
+                        img.thumbnail((280, 180))
                         photo = ImageTk.PhotoImage(img)
                         win._photo_refs.append(photo)
-                        lbl = tk.Label(img_scroll.inner, image=photo, bg="#f0f0f0")
-                        lbl.pack(anchor="w", pady=3, padx=4)
-                        img_scroll.bind_mousewheel(lbl)
+                        content_text.insert(tk.END, "\n")
+                        content_text.image_create(tk.END, image=photo, padx=2, pady=2)
+                        win._image_map[str(photo)] = img_path
                     except Exception:
                         pass
-        elif not PIL_AVAILABLE and t.get("images"):
-            tk.Label(win, text=f"[{len(t['images'])} 张图片，需安装 Pillow 查看]",
-                     font=("Microsoft YaHei", 9), fg="#999", bg="#f0f0f0").pack(padx=12)
+        elif t.get("images"):
+            content_text.insert(tk.END, f"\n[{len(t['images'])} 张图片，需安装 Pillow 查看]")
+
+        win._detail_pending = []  # temp images pasted in this window
+
+        def paste_image_detail(_event):
+            if not PIL_AVAILABLE:
+                return
+            try:
+                img = ImageGrab.grabclipboard()
+                if isinstance(img, Image.Image):
+                    tmp_name = f"tmp_{uuid.uuid4().hex}.png"
+                    tmp_path = os.path.join(IMAGES_DIR, tmp_name)
+                    img.save(tmp_path, "PNG")
+                    thumb = img.copy()
+                    thumb.thumbnail((280, 180))
+                    photo = ImageTk.PhotoImage(thumb)
+                    win._detail_pending.append((tmp_path, photo))
+                    win._photo_refs.append(photo)
+                    win._image_map[str(photo)] = tmp_path
+                    content_text.image_create(tk.INSERT, image=photo, padx=2, pady=2)
+                    content_text.insert(tk.INSERT, "\n")
+                    return "break"
+            except Exception:
+                pass
+
+        content_text.bind("<Control-v>", paste_image_detail)
+
+        def on_double_click(event):
+            idx = content_text.index(f"@{event.x},{event.y}")
+            items = content_text.dump(idx, content_text.index(f"{idx}+1c"), image=True)
+            if not items:
+                return
+            photo_key = items[0][1]
+            file_path = win._image_map.get(photo_key)
+            if file_path and os.path.exists(file_path):
+                os.startfile(file_path)
+                return "break"
+
+        content_text.bind("<Double-Button-1>", on_double_click)
+
+        def on_detail_close():
+            for tmp_path, _ in win._detail_pending:
+                try:
+                    if os.path.exists(tmp_path):
+                        os.remove(tmp_path)
+                except OSError:
+                    pass
+            win.destroy()
+
+        win.protocol("WM_DELETE_WINDOW", on_detail_close)
 
     # ── Render ────────────────────────────────────────────
     def refresh_all_views(self):
@@ -470,7 +508,6 @@ class TodoApp:
         lbl.pack(side="left", fill="x", expand=True)
         self.today_scroll.bind_mousewheel(lbl)
 
-        # Buttons
         done_btn = tk.Button(row, text="完成", bg="#2196F3", fg="white",
                              font=("Microsoft YaHei", 8), relief="flat", padx=6, cursor="hand2",
                              command=lambda tid=t["id"]: self.mark_done(tid))
@@ -504,7 +541,6 @@ class TodoApp:
                      font=("Microsoft YaHei", 9), fg="#999").pack(pady=10)
             return
 
-        # Header row
         hdr = tk.Frame(inner, bg="#e0e0e0")
         hdr.pack(fill="x")
         tk.Label(hdr, text="日期", bg="#e0e0e0", font=("Microsoft YaHei", 8, "bold"),
@@ -634,7 +670,7 @@ class TodoApp:
                 self.root.after(0, self.refresh_all_views)
                 return
             try:
-                val = entry.get()
+                entry.get()
             except tk.TclError:
                 cleanup()
                 return
